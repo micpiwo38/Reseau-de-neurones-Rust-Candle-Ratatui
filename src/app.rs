@@ -31,6 +31,7 @@ pub struct App{
     pub rx_ia: Receiver<IAMessage>, //Recepteur de message de l'IA
     pub tx_ia_cmd: Sender<String>, //Emetteur pour envoyer les ordre a l'IA
     pub cursor_position: usize, //Position du curseur dans le prompt
+    pub scroll_offset: usize,
 }
 
 impl App{
@@ -45,6 +46,7 @@ impl App{
             rx_ia,
             tx_ia_cmd,
             cursor_position: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -68,7 +70,7 @@ impl App{
             ]).split(chunks[0]);
 
         //La Zone de chat
-        let chat_items: Vec<ListItem> = app
+        let chat_items: Vec<Line> = app
             .historique_chat
             .iter()
             .map(|msg|{
@@ -79,12 +81,16 @@ impl App{
                 }else{
                     Style::default().fg(Color::LightYellow).add_modifier(Modifier::ITALIC)
                 };
-                ListItem::new(Line::from(Span::styled(msg, style)))
+                Line::from(Span::styled(msg, style))
             })
             .collect();
+        let box_height = main_chunks[0].height as usize;
+        let max_scroll = chat_items.len().saturating_sub(box_height.saturating_sub(2));
+        let current_scroll = (app.scroll_offset as u16).min(max_scroll as u16);
 
-        let chat_list = List::new(chat_items)
-            .block(Block::default().borders(Borders::ALL).title("Discussion avec LLM MIC_IA"));
+        let chat_list = Paragraph::new(chat_items)
+            .block(Block::default().borders(Borders::ALL).title("Discussion avec LLM MIC_IA"))
+            .scroll((current_scroll, 0));
         frame.render_widget(chat_list, main_chunks[0]);
 
         //Zone de saisie utilisateur
@@ -155,10 +161,14 @@ impl App{
             ));
 
             //3. Boucle d'entrainement
-            let total_step = 50;
-            let batch_size = 8;
-            let seq_len = 16;
-            let learning_rate = 0.1f32; // Vitesse d'aprentissage
+            let total_step = 10000;
+            let batch_size = 32;
+            let seq_len = 32;
+            /*
+            En divisant par 10, tu demandes à l'IA d'être 10 fois plus prudente et minutieuse dans ses ajustements de neurones.
+            Jumelé aux 10 000 étapes, elle aura largement le temps de peaufiner sa grammaire PHP sans faire de "crises de panique" mathématiques !
+             */
+            let learning_rate = 0.01f32; // Vitesse d'aprentissage
 
             for step in 1..=total_step{
                 //1. Generation des lots (batchs) = X entrée, Y_true (ce que IA doit deviner)
@@ -211,7 +221,7 @@ impl App{
                 }
                 let pourcentage = (step * 100 / total_step) as u16;
                 let _ = tx_ia.send(IAMessage::ProgressionEntainement(pourcentage));
-                thread::sleep(Duration::from_millis(20));
+                //thread::sleep(Duration::from_millis(1));
             }
 
             //Envoie du message dans le chat cpour confimer le chargent du fichier de données
@@ -298,10 +308,19 @@ impl App{
                                     app.input.remove(byte_index);
                                 }
                             }
+                            //Scroll Haut et BAs
+                            KeyCode::Up => {
+                                app.scroll_offset = app.cursor_position.saturating_sub(1)
+                            }
+                            KeyCode::Down => {
+                                app.scroll_offset = app.cursor_position.saturating_sub(1)
+                            }
                             KeyCode::Enter => {
                                 if !app.input.is_empty(){
                                     let message = app.input.drain(..).collect::<String>(); //Stock de la question utilisateur
                                     app.historique_chat.push(format!("Vous : {}", message));
+                                    //Auto scroll
+                                    app.scroll_offset = app.historique_chat.len();
                                     //Envoie la commande au fil thread IA
                                     let _ = app.tx_ia_cmd.send(message);
                                     //Effacer le prompt + position du curseur
@@ -325,6 +344,7 @@ impl App{
                     }
                     IAMessage::ResponseChat(texte) => {
                         app.historique_chat.push(format!("MIC_IA : {}",texte));
+                        app.scroll_offset = app.historique_chat.len();
                     }
                 }
             }
