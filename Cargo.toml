@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-candle-core = "0.8.2" # Core tensor opération
-candle-nn = "0.8.2" #  Calque et module de réseau neuronal
+candle-core = "0.8.4" # Core tensor opération
+candle-nn = "0.8.4" #  Calque et module de réseau neuronal
 anyhow = "1.0" # Analyseur d'erreur ergonomique avec context
 #MATH
 rand = "0.8"

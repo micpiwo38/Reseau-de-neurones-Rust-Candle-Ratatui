@@ -1,73 +1,85 @@
 
-use candle_core::{Device, Result as CandleResult, Tensor, DType, Var};
+use candle_core::{Device, Result as CandleResult, Tensor, DType, Var, Module};
+use candle_nn::{Linear, VarBuilder, VarMap, GRU, RNN};
 use rand::Rng;
 
 pub struct Model{
-    pub weights: Var,
-    pub bias: Var,
+    pub gru: GRU, //Gated Recurent Unit => eviter d'oublier les entrainement
+    fc: Linear,
+    pub vocab_size: usize,
+    pub hidden_dim: usize,
+    varmap: VarMap,
 }
 
 impl Model{
     //Init d'une nouvelle couche linéaire avec des poids aléatoire
-    pub fn new(vocab_size: usize, device: &Device) -> CandleResult<Self>{
-        //Poids aléatoire
-        let w_init = Tensor::randn(0.0f32, 0.1f32, (vocab_size, vocab_size), device)?;
-        //Par defaut le biais est a 0
-        let b_init = Tensor::zeros((1, vocab_size), DType::F32, device)?;
-        //1. Matrice de poids de taille [vocab_taille, vocan_taille]
-        //On utilise rand N pour casser la symetrie
-        let weights = Var::from_tensor(&w_init)?;
-        //Un bias est un écart entre la vraie valeur d'une variable inobservable et la valeur estimée statistiquement
-        //2. Un bias pour chaque caractères du vecteur vocubulaire [1 et vocab taille]
-        let bias = Var::from_tensor(&b_init)?;
+    pub fn new(vocab_size: usize, hidden_dim: usize, device: &Device) -> CandleResult<Self>{
+        //VarMap =  initialisation et stockage de nos variables (poids)
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, device);
 
-        Ok(Self{weights, bias})
+        //1. La couche GRU gere la memoire, elle prend en entrée un caractère (one-hot vocab_size) et le met en cache (hidden_dim)
+        let gru = candle_nn::gru(vocab_size, hidden_dim, Default::default(), vs.pp("gru"))?;
+        //2. Une couche lineaire de sortie pour re-transformer la memoire en scores de caractères
+        let fc = candle_nn::linear(hidden_dim, vocab_size, vs.pp("fc"))?;
+
+        Ok(Self{
+            gru, fc, vocab_size, hidden_dim, varmap
+        })
+    }
+    //Helper
+    pub fn variables(&self) -> Vec<Var> {
+        self.varmap.all_vars()
     }
 
     //Forward Pass prend l'entrée X at applique les poids et le bias
     /// Le "Forward Pass" corrigé avec détection de rang flexible
+    /// Le Forward Pass avec mémoire temporelle
     pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        // Au lieu de forcer dims2(), on analyse la forme de manière flexible
-        let dims = x.dims();
-        let (batch_size, seq_len) = match dims.len() {
-            1 => (1, dims[0]), // Si c'est un tenseur 1D [seq_len]
-            2 => (dims[0], dims[1]), // Si c'est un tenseur 2D [batch_size, seq_len]
-            _ => return Err(candle_core::Error::Msg(format!("Tenseur d'entrée invalide, dimensions reçues : {:?}", dims))),
-        };
+        let (batch_size, seq_len) = x.dims2()?;
 
-        let vocab_size = self.bias.as_tensor().dim(1)?; // 97
-
-        // 1. Convertir les IDs en vecteurs de taille 'vocab_size' (One-hot encoding)
-        let mut on_hot_data = vec![0.0f32; batch_size * seq_len * vocab_size];
-
-        // On aplatit x temporairement en un vecteur 1D pour lire facilement ses IDs
-        let x_flat = x.flatten_all()?.to_dtype(candle_core::DType::U32)?.to_vec1::<u32>()?;
-
+        // 1. One-Hot encoding de l'entrée [batch_size, seq_len] -> [batch_size, seq_len, vocab_size]
+        let mut on_hot_data = vec![0.0f32; batch_size * seq_len * self.vocab_size];
+        let x_ids = x.to_dtype(candle_core::DType::U32)?.to_vec2::<u32>()?;
         for b in 0..batch_size {
             for s in 0..seq_len {
-                let flat_idx = b * seq_len + s;
-                let id = x_flat[flat_idx] as usize;
-                if id < vocab_size {
-                    on_hot_data[b * seq_len * vocab_size + s * vocab_size + id] = 1.0;
+                let id = x_ids[b][s] as usize;
+                if id < self.vocab_size {
+                    on_hot_data[b * self.vocab_size * seq_len + s * self.vocab_size + id] = 1.0;
                 }
             }
         }
 
-        // On transforme nos données one-hot en Tenseur Candle [batch_size * seq_len, vocab_size]
-        let x_one_hot = Tensor::from_vec(on_hot_data, (batch_size * seq_len, vocab_size), x.device())?;
+        let x_one_hot = Tensor::from_vec(on_hot_data, (batch_size, seq_len, self.vocab_size), x.device())?;
 
-        // 2. Équation linéaire : Y = X * W + B
-        let mut y = x_one_hot.matmul(&self.weights.as_tensor())?;
-        y = y.broadcast_add(&self.bias.as_tensor())?;
+        // 2. Traitement manuel de la séquence
+        let mut outputs = Vec::with_capacity(seq_len);
 
-        // 3. On redonne à la sortie sa forme 3D d'origine : [batch_size, seq_len, vocab_size]
-        y.reshape((batch_size, seq_len, vocab_size))
+        // Initialisation de l'état initial
+        let mut state = self.gru.zero_state(batch_size)?;
+
+        // On parcourt la séquence étape par étape
+        for s in 0..seq_len {
+            let current_input = x_one_hot.narrow(1, s, 1)?.squeeze(1)?;
+
+            // state est un GRUState
+            state = self.gru.step(&current_input, &state)?;
+
+            // L'astuce magique : state.h permet d'extraire le vrai Tensor caché dans le GRUState !
+            outputs.push(state.h.clone());
+        }
+
+        // Maintenant, outputs contient uniquement des Tensor, Tensor::stack va adorer !
+        let states_tensor = Tensor::stack(&outputs, 1)?;
+
+        // 3. Projection linéaire finale
+        let flattened_states = states_tensor.reshape((batch_size * seq_len, self.hidden_dim))?;
+        let output = self.fc.forward(&flattened_states)?;
+
+        // 4. Forme de sortie finale = tenseur a 3 dimensions
+        output.reshape((batch_size, seq_len, self.vocab_size))
     }
 
-    //Recuperer la liste de toutes les variables a mettre a jour
-    pub fn variables(&self) -> Vec<Var>{
-        vec![self.weights.clone(), self.bias.clone()]
-    }
 
     //Generer une reponse a partir du prompt utilisateur
     /// Génère du texte avec échantillonnage par Température
@@ -75,58 +87,36 @@ impl Model{
         &self,
         amorce: &str,
         longueur: usize,
-        temperature: f32, // Nouvelle variable ! (ex: 0.7)
         dataset: &crate::dataset::TextDataset,
         device: &Device,
     ) -> CandleResult<String> {
         let mut progression_texte = amorce.to_string();
-        let mut rng = rand::thread_rng();
 
         for _ in 0..longueur {
             let encode = dataset.encoder(&progression_texte);
-            let debut = encode.len().saturating_sub(16);
+            // On prend une fenêtre glissante des 32 derniers caractères pour la mémoire du GRU
+            let debut = encode.len().saturating_sub(32);
             let contexte = &encode[debut..];
-
+            // Dans ta fonction generer / generate_response, au milieu de la boucle for :
             let x = Tensor::from_vec(contexte.to_vec(), (1, contexte.len()), device)?;
-            let logits = self.forward(&x)?;
+            let logits = self.forward(&x)?; // Forme obtenue : [1, seq_len, vocab_size]
 
-            let last_step_logits = logits.get(0)?;
-            let final_logits = last_step_logits.get(last_step_logits.dim(0)? - 1)?;
-
-            // Convertit le tenseur de scores en Vec Rust
+            // 1. On extrait le premier (et seul) batch -> Forme : [seq_len, vocab_size]
+            let batch_logits = logits.get(0)?; // [seq_len, vocab_size]
+            // 2. On extrait la DERNIÈRE étape temporelle de la séquence -> Forme : [vocab_size] (1D)
+            let seq_len_idx = batch_logits.dim(0)? -1;
+            let final_logits = batch_logits.get(seq_len_idx)?; // [vocab_size]
+            // 3. On convertit ce tenseur 1D en Vec<f32> pour l'échantillonnage
             let scores = final_logits.to_vec1::<f32>()?;
-            let vocab_size = scores.len();
-
-            // --- APPLICATION DE LA TEMPÉRATURE & SOFTMAX MANUEL ---
-            // 1. Division des scores par la température et passage à l'exponentielle
-            let mut exp_scores: Vec<f32> = scores
-                .iter()
-                .map(|&s| (s / temperature).exp())
-                .collect();
-
-            // 2. Calcul de la somme pour normaliser (Somme des probabilités = 1.0)
-            let somme_exp: f32 = exp_scores.iter().sum();
-
-            // 3. Transformation en probabilités
-            let probabilites: Vec<f32> = exp_scores
-                .iter_mut()
-                .map(|val| *val / somme_exp)
-                .collect();
-
-            // --- TIRAGE AU SORT PONDÉRÉ (Hasard contrôlé) ---
-            let mut tirage: f32 = rng.r#gen(); // Nombre aléatoire entre 0.0 et 1.0
+            let mut max_val = scores[0];
             let mut id_u32 = 0u32;
-            let mut somme_cumulee = 0.0;
-
-            for (idx, &prob) in probabilites.iter().enumerate() {
-                somme_cumulee += prob;
-                if tirage <= somme_cumulee {
+            for (idx, &val) in scores.iter().enumerate() {
+                if val > max_val {
+                    max_val = val;
                     id_u32 = idx as u32;
-                    break;
                 }
             }
 
-            // Décodage et ajout du caractère
             let caractere_suivant = dataset.decoder(&[id_u32]);
             progression_texte.push_str(&caractere_suivant);
         }

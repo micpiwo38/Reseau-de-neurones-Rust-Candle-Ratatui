@@ -140,8 +140,9 @@ impl App{
 
             let _ = tx_ia.send(IAMessage::ResponseChat(format!("MIC_IA : Données chargées ! Vocbulaire de {} de caractères unique.", vocab_size)));
 
+            let hidden_dim = 128;
             //Initialisé le modele
-            let model = match crate::model::Model::new(vocab_size, &device) {
+            let model = match crate::model::Model::new(dataset.vocab_size, hidden_dim, &device) {
                 Ok(model) => model,
                 Err(e) => {
                     let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur de chargement du modele et d'initialisation du reseau de neurone : {}", e)));
@@ -222,7 +223,7 @@ impl App{
                 let _ = tx_ia.send(IAMessage::ResponseChat("MIC_IA : En cours de génération ...".to_string()));
                 let temperature = 0.7f32; //Pertinence de la réponse en 0.1 et 1.0
                 //Generer 50 caractères a partir du prompt utilisateur
-                match model.generate_response(&cmd, 80, temperature, &dataset, &device) {
+                match model.generate_response(&cmd, 80, &dataset, &device) {
                     Ok(generated_response) => {
                         let _ = tx_ia.send(IAMessage::ResponseChat(format!(
                             "Votre réponse :\n{}", generated_response

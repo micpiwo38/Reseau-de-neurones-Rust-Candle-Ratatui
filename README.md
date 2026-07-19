@@ -51,3 +51,5 @@
 
 ### 6. On ajoute ce nouveau caractère à notre texte et on recommence !
 
+#### RNN -> Réseau de Neuronnes Récurent : Structure Gated Recurent Unit pour eviter l'oublis des mots
+

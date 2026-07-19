@@ -7,6 +7,7 @@ use candle_core::{Tensor, Device, Result as CandleResult};
 pub struct TextDataset{
     pub raw_text: String,
     pub vocabulaire: Vec<char>, //Tableau Vecteur de caractère
+    pub vocab_size:usize,
 }
 
 impl TextDataset{
@@ -25,7 +26,8 @@ impl TextDataset{
 
         let mut vocabulaire: Vec<char> = char_set.into_iter().collect();
         vocabulaire.sort(); //Tri dans un ordre deterministe
-        Ok(Self{raw_text, vocabulaire})
+        let vocab_size = vocabulaire.len();
+        Ok(Self{raw_text, vocabulaire, vocab_size})
     }
 
     //Taille du vecteur voculaire = (nombre de tokens uniques possible)
