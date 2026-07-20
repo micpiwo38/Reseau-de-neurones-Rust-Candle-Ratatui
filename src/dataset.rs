@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use candle_core::{Tensor, Device, Result as CandleResult};
+use crate::tokenizer::{format_chatml, Sample};
+
 pub struct TextDataset{
     pub raw_text: String,
     pub vocabulaire: Vec<char>, //Tableau Vecteur de caractère
@@ -34,6 +36,41 @@ impl TextDataset{
     pub fn vocabulaire_length(&self) -> usize{
         self.vocabulaire.len()
     }
+
+    pub fn load_dataset<P: AsRef<Path>>(path: P) -> io::Result<Self>{
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut combined_text = String::new();
+
+        for (index, line) in reader.lines().enumerate() {
+            let line_content = line?;
+            if line_content.trim().is_empty() {
+                continue;
+            }
+
+            match serde_json::from_str::<Sample>(&line_content) {
+                Ok(sample) => {
+                    let formatted = format_chatml(&sample);
+                    combined_text.push_str(&formatted);
+                }
+                Err(e) => {
+                    eprintln!("Erreur de parsing JSONL ligne {} : {}", index + 1, e);
+                }
+            }
+        }
+
+        //Création du vocabulaire sur le texte combiné et formatté
+        let mut char_set = HashSet::new();
+        for c in combined_text.chars(){
+            char_set.insert(c);
+        }
+
+        let mut vocabulaire: Vec<char> = char_set.into_iter().collect();
+        vocabulaire.sort();
+        let vocab_size = vocabulaire.len();
+        Ok(Self{raw_text: combined_text, vocabulaire, vocab_size})
+    }
+
     //Generer des lot (Batch) alatoire de données d'entrainement sous forme de tenseur crate Candle
     pub fn generate_batch_tensor(&self, batch_size: usize, seq_len: usize, device: &Device) -> CandleResult<(Tensor, Tensor)> {
         let text_encode = self.encoder(&self.raw_text);

@@ -2,6 +2,20 @@
 
 ## Neural Network Architecture
 
+#### Construction : cargo build --release
+#### Cible : C:\AI_Training\target\release\Ai_Trainig.exe
+
+## Comment fonctionne un LLM ?
+
+#### L’entrainement initial : C’est la première étape, et la plus gourmande en données. 
+#### Les LLM sont entraînés sur des milliards de mots et de phrases pour identifier des schémas et des relations. 
+#### Durant cette phase, le LLM apprend à prédire le mot suivant dans une séquence en développant une compréhension statistique du langage. 
+#### C’est le fondement de sa capacité à générer du texte cohérent.  
+Le fine-tuning supervisé : Une fois entraîné sur une base de données générale, le modèle subit un réglage affiné. 
+#### On lui donne des instructions plus spécifiques pour qu’il s’adapte à des tâches précises : répondre à des questions, suivre des instructions ou encore adopter un ton approprié. 
+#### Cette étape est cruciale pour “spécialiser” le modèle et le rendre plus performant sur des cas d’usage précis.
+#### L’apprentissage par renforcement à partir de retours humains (Reinforcement Learning Human Feedback) : Cette phase est essentielle pour aligner le modèle avec les attentes humaines. Des retours de personnes sont utilisés pour corriger les réponses du modèle. L’objectif est de le guider pour qu’il donne des réponses utiles, pertinentes et sans danger, tout en évitant les contenus faux, inappropriés ou agressifs.
+
 ### Input Text → Tokenizer → Embedding → Mean Pooling → Linear → Softmax → Prediction
                             ↓            ↓            ↓         ↓
                         [N, 16]        [16]         [2]       [2]

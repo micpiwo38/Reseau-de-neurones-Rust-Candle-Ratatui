@@ -3,6 +3,7 @@ use std::io;
 pub mod app;
 pub mod dataset;
 pub mod model;
+pub mod tokenizer;
 
 use crate::app::{App};
 

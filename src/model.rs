@@ -2,13 +2,14 @@
 use candle_core::{Device, Result as CandleResult, Tensor, DType, Var, Module};
 use candle_nn::{Linear, VarBuilder, VarMap, GRU, RNN};
 use rand::Rng;
+use ratatui::widgets::Dataset;
 
 pub struct Model{
     pub gru: GRU, //Gated Recurent Unit => eviter d'oublier les entrainement
     fc: Linear,
     pub vocab_size: usize,
     pub hidden_dim: usize,
-    varmap: VarMap,
+    pub varmap: VarMap,
 }
 
 impl Model{
@@ -27,9 +28,25 @@ impl Model{
             gru, fc, vocab_size, hidden_dim, varmap
         })
     }
-    //Helper
+    //-------------------------Helper--------------------------------------//
     pub fn variables(&self) -> Vec<Var> {
         self.varmap.all_vars()
+    }
+
+    //+-------------------------Fonction pour choisir un indice selon la distributions des probabilités (échantillonnage multinomial)
+    // Petit helper pour échantillonner selon les probabilités de la Softmax
+    fn sample_multinomial(probs: &[f32]) -> usize {
+        let mut rng = rand::thread_rng();
+        let sample: f32 = rand::Rng::r#gen(&mut rng);
+
+        let mut cumulative_prob = 0.0;
+        for (i, &p) in probs.iter().enumerate() {
+            cumulative_prob += p;
+            if sample <= cumulative_prob {
+                return i;
+            }
+        }
+        probs.len() - 1
     }
 
     //Forward Pass prend l'entrée X at applique les poids et le bias
@@ -83,10 +100,12 @@ impl Model{
 
     //Generer une reponse a partir du prompt utilisateur
     /// Génère du texte avec échantillonnage par Température
+    /// Génère du texte avec Échantillonnage par Température (Softmax)
     pub fn generate_response(
         &self,
         amorce: &str,
         longueur: usize,
+        temperature: f32, // <-- On a ajouté la température ici (ex: 0.7)
         dataset: &crate::dataset::TextDataset,
         device: &Device,
     ) -> CandleResult<String> {
@@ -94,29 +113,39 @@ impl Model{
 
         for _ in 0..longueur {
             let encode = dataset.encoder(&progression_texte);
-            // On prend une fenêtre glissante des 32 derniers caractères pour la mémoire du GRU
             let debut = encode.len().saturating_sub(32);
             let contexte = &encode[debut..];
-            // Dans ta fonction generer / generate_response, au milieu de la boucle for :
+
             let x = Tensor::from_vec(contexte.to_vec(), (1, contexte.len()), device)?;
-            let logits = self.forward(&x)?; // Forme obtenue : [1, seq_len, vocab_size]
+            let logits = self.forward(&x)?; // Forme: [1, seq_len, vocab_size]
 
-            // 1. On extrait le premier (et seul) batch -> Forme : [seq_len, vocab_size]
-            let batch_logits = logits.get(0)?; // [seq_len, vocab_size]
-            // 2. On extrait la DERNIÈRE étape temporelle de la séquence -> Forme : [vocab_size] (1D)
-            let seq_len_idx = batch_logits.dim(0)? -1;
-            let final_logits = batch_logits.get(seq_len_idx)?; // [vocab_size]
-            // 3. On convertit ce tenseur 1D en Vec<f32> pour l'échantillonnage
-            let scores = final_logits.to_vec1::<f32>()?;
-            let mut max_val = scores[0];
-            let mut id_u32 = 0u32;
-            for (idx, &val) in scores.iter().enumerate() {
-                if val > max_val {
-                    max_val = val;
-                    id_u32 = idx as u32;
+            // 1. Extraire le batch et la dernière étape temporelle
+            let batch_logits = logits.get(0)?;
+            let seq_len_idx = batch_logits.dim(0)? - 1;
+            let final_logits = batch_logits.get(seq_len_idx)?; // Forme: [vocab_size]
+
+            let id_u32 = if temperature <= 0.0 {
+                // Mode Strict / Greedy (Prend le maximum absolu)
+                let scores = final_logits.to_vec1::<f32>()?;
+                let mut max_val = scores[0];
+                let mut max_idx = 0u32;
+                for (idx, &val) in scores.iter().enumerate() {
+                    if val > max_val {
+                        max_val = val;
+                        max_idx = idx as u32;
+                    }
                 }
-            }
+                max_idx
+            } else {
+                // Mode Température avec Softmax + Échantillonnage
+                let scaled_logits = (&final_logits / (temperature as f64))?;
+                let probs_tensor = candle_nn::ops::softmax(&scaled_logits, 0)?;
+                let probs = probs_tensor.to_vec1::<f32>()?;
 
+                Self::sample_multinomial(&probs) as u32
+            };
+
+            // On utilise la méthode de TON dataset : decoder()
             let caractere_suivant = dataset.decoder(&[id_u32]);
             progression_texte.push_str(&caractere_suivant);
         }

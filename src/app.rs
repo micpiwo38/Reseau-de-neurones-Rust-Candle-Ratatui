@@ -114,7 +114,7 @@ impl App{
         ));
 
         //Barre de progression de l'entainement
-        let titre_gauge = format!("Entraînement du modèle a partir du dataset.txt ... {}", app.progression);
+        let titre_gauge = format!("Entraînement du modèle a partir du dataset.jsonl ... {}", app.progression);
         let gauge = Gauge::default()
             .block(Block::default().borders(Borders::ALL).title(titre_gauge))
             .gauge_style(Style::default().fg(Color::LightGreen).bg(Color::Gray).add_modifier(Modifier::ITALIC))
@@ -131,18 +131,44 @@ impl App{
             //Construire un chemin propre vers le fichier de données
             let dataset_path = std::path::Path::new(project_root)
                 .join("dataset")
-                .join("php_mysql.txt");
+                .join("php_mysql_QR.jsonl");
+            // 2. Vérification explicite de l'existence du fichier
+            if !dataset_path.exists() {
+                let err_msg = format!("Fichier dataset introuvable à l'adresse : {:?}", dataset_path);
+                println!("{}", err_msg);
+                let _ = tx_ia.send(IAMessage::ResponseChat(format!("MIC_IA : Erreur : {}", err_msg)));
+                return;
+            }
             //1. Charger le dataset fichier php_mysql.txt
-            let dataset = match crate::dataset::TextDataset::load_from_file(dataset_path) {
+            // 3. Charger le dataset via JSONL
+            let dataset = match crate::dataset::TextDataset::load_dataset(&dataset_path) {
                 Ok(dataset) => dataset,
                 Err(e) => {
-                    let _ = tx_ia.send(IAMessage::ResponseChat(format!("MIC_IA : Erreur de chargement et d'analyse de la base de données : {}", e)));
+                    let _ = tx_ia.send(IAMessage::ResponseChat(format!(
+                        "MIC_IA : Erreur lors de la lecture du fichier : {}", e
+                    )));
                     return;
                 }
             };
             //2. Init du periphérique de calcul Candle tensor Batch avec le GPU
-            let device = candle_core::Device::Cpu;
+            let device = candle_core::Device::new_cuda(0).unwrap_or_else(|_e|{
+                eprintln!("CUDA est indisponible ({}), retourne sur ton CPU", _e);
+                candle_core::Device::Cpu
+            });
+            if device.is_cuda(){
+                let _ = tx_ia.send(IAMessage::ResponseChat(
+                    "MIC_IA : Accélération matérielle activée sur la carte GPU NVIDIA !".to_string()
+                ));
+            }
             let vocab_size = dataset.vocabulaire_length();
+
+            // 4. Sécurité supplémentaire : vérifier que le vocabulaire n'est pas vide
+            if dataset.vocab_size == 0 {
+                let _ = tx_ia.send(IAMessage::ResponseChat(
+                    "MIC_IA : Le fichier dataset est vide ou le format JSONL n'a pas pu être lu !".to_string()
+                ));
+                return;
+            }
 
             let _ = tx_ia.send(IAMessage::ResponseChat(format!("MIC_IA : Données chargées ! Vocbulaire de {} de caractères unique.", vocab_size)));
 
@@ -160,15 +186,11 @@ impl App{
                 "MIC_IA : Réseau de neurones initialisé avec succès !".to_string()
             ));
 
-            //3. Boucle d'entrainement
-            let total_step = 10000;
-            let batch_size = 32;
-            let seq_len = 32;
-            /*
-            En divisant par 10, tu demandes à l'IA d'être 10 fois plus prudente et minutieuse dans ses ajustements de neurones.
-            Jumelé aux 10 000 étapes, elle aura largement le temps de peaufiner sa grammaire PHP sans faire de "crises de panique" mathématiques !
-             */
-            let learning_rate = 0.01f32; // Vitesse d'aprentissage
+            // 3. Boucle d'entraînement (Ajustements recommandés)
+            let total_step = 10000;    // Donne-lui assez de temps pour converger
+            let batch_size = 128;       // Réduit légèrement si tu augmentes seq_len
+            let seq_len = 128;         // Plus long pour capter la structure ChatML + PHP
+            let learning_rate = 0.0003f32; // 0.0003 au lieu de 0.005 !! (Essentiel)
 
             for step in 1..=total_step{
                 //1. Generation des lots (batchs) = X entrée, Y_true (ce que IA doit deviner)
@@ -231,9 +253,9 @@ impl App{
             //Attente de la question de l'utilisateur
             while let Ok(cmd) = rx_cmd.recv() {
                 let _ = tx_ia.send(IAMessage::ResponseChat("MIC_IA : En cours de génération ...".to_string()));
-                let temperature = 0.7f32; //Pertinence de la réponse en 0.1 et 1.0
+                let temperature = 0.2f32; //Pertinence de la réponse en 0.1 et 1.0
                 //Generer 50 caractères a partir du prompt utilisateur
-                match model.generate_response(&cmd, 80, &dataset, &device) {
+                match model.generate_response(&cmd, 80,0.7f32, &dataset, &device) {
                     Ok(generated_response) => {
                         let _ = tx_ia.send(IAMessage::ResponseChat(format!(
                             "Votre réponse :\n{}", generated_response
