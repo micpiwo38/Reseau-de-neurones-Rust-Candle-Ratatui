@@ -6,7 +6,7 @@ use crossterm::{
 
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, ListItem, Gauge, List, Paragraph },
+    widgets::{Block, Borders, Gauge, Paragraph},
 };
 
 use std::{
@@ -15,31 +15,34 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
+use candle_core::{DType, Device};
+use candle_nn::{Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use ratatui::widgets::Wrap;
+use crate::model::Model;
 
 //-----------------STRUCTURE UI DE APPLICATION--------------------//
-//Enumeration des messages que le moteur IA peut envoyer a Ratatui
-pub enum IAMessage{
+pub enum IAMessage {
     ProgressionEntainement(u16), // % de 0 a 100%
-    ResponseChat(String), //Texte générer par le LLM
+    ResponseChat(String),        // Texte généré par le LLM
+    StreamChunk(String),
 }
 
-pub struct App{
-    pub input: String, //Input utilisateur
-    pub historique_chat: Vec<String>, //Historique de discussion
-    pub progression: u16, //Progression de l'entrainement
-    pub rx_ia: Receiver<IAMessage>, //Recepteur de message de l'IA
-    pub tx_ia_cmd: Sender<String>, //Emetteur pour envoyer les ordre a l'IA
-    pub cursor_position: usize, //Position du curseur dans le prompt
+pub struct App {
+    pub input: String,                // Input utilisateur
+    pub historique_chat: Vec<String>, // Historique de discussion
+    pub progression: u16,             // Progression de l'entrainement
+    pub rx_ia: Receiver<IAMessage>,   // Récepteur de message de l'IA
+    pub tx_ia_cmd: Sender<String>,    // Émetteur pour envoyer les ordres a l'IA
+    pub cursor_position: usize,      // Position du curseur dans le prompt
     pub scroll_offset: usize,
 }
 
-impl App{
-    pub fn new(rx_ia: Receiver<IAMessage>, tx_ia_cmd: Sender<String>) -> Self{
-        Self{
+impl App {
+    pub fn new(rx_ia: Receiver<IAMessage>, tx_ia_cmd: Sender<String>) -> Self {
+        Self {
             input: String::new(),
             historique_chat: vec![
-                "MIC_IA : Bienvenue dans le LLM Mic-IA !".to_string(),
+                "MIC_IA : LLM Mic-IA PHP Master !".to_string(),
                 "MIC_IA : En attente du lancement de l'entraînement ...".to_string(),
             ],
             progression: 0,
@@ -50,220 +53,244 @@ impl App{
         }
     }
 
+    //-------------------------Helper--------------------------------------//
+    /*
+    pub fn variables(&self) -> Vec<Var> {
+        self.varmap.all_vars()
+    }
+    */
+
     //------------------------------------UI----------------------------//
-    pub fn ui(frame: &mut Frame, app: &App){
-        //Decoupe de l'ecran: ZOne proincipale en haut et barre de progression en bas
+    pub fn ui(frame: &mut Frame, app: &App) {
+        // Découpe de l'écran : Zone principale en haut et barre de progression en bas
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(10),
-                Constraint::Length(3),
-            ])
+            .constraints([Constraint::Min(10), Constraint::Length(3)])
             .split(frame.area());
 
-        //Decoupe de la zone principale, le chat en haut et input utilisateur en bas
+        // Découpe de la zone principale : chat en haut et input utilisateur en bas
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(3),
-                Constraint::Length(3),
-            ]).split(chunks[0]);
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .split(chunks[0]);
 
-        //La Zone de chat
+        // La Zone de chat
         let chat_items: Vec<Line> = app
             .historique_chat
             .iter()
-            .map(|msg|{
-                let style = if msg.starts_with("Vous : "){
+            .map(|msg| {
+                let style = if msg.starts_with("Vous : ") {
                     Style::default().fg(Color::LightGreen)
-                }else if msg.starts_with("MIC_IA : "){
+                } else if msg.starts_with("MIC_IA : ") {
                     Style::default().fg(Color::LightRed)
-                }else{
-                    Style::default().fg(Color::LightYellow).add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::ITALIC)
                 };
                 Line::from(Span::styled(msg, style))
             })
             .collect();
+
         let box_height = main_chunks[0].height as usize;
         let max_scroll = chat_items.len().saturating_sub(box_height.saturating_sub(2));
         let current_scroll = (app.scroll_offset as u16).min(max_scroll as u16);
 
         let chat_list = Paragraph::new(chat_items)
-            .block(Block::default().borders(Borders::ALL).title("Discussion avec LLM MIC_IA"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Discussion avec LLM MIC_IA MASTER PHP"),
+            )
+            .wrap(Wrap { trim: true })
             .scroll((current_scroll, 0));
         frame.render_widget(chat_list, main_chunks[0]);
 
-        //Zone de saisie utilisateur
+        // Zone de saisie utilisateur
         let input_widget = Paragraph::new(app.input.as_str())
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::ALL).title("Votre question ?"));
         frame.render_widget(input_widget, main_chunks[1]);
 
-        // ---- AJOUT DU CURSEUR CLIGNOTANT ----
-        // On place le curseur juste après le dernier caractère saisi
-        // main_chunks[1].x + 1 pour sauter la bordure gauche du bloc
-        // main_chunks[1].y + 1 pour sauter la bordure haute du bloc
-        frame.set_cursor_position(Position::new(
-            main_chunks[1].x + 1 + app.input.chars().count() as u16,
-            main_chunks[1].y + 1,
-        ));
-        //Position dynamique du curseur
+        // Placement dynamique du curseur
         frame.set_cursor_position(Position::new(
             main_chunks[1].x + 1 + app.cursor_position as u16,
             main_chunks[1].y + 1,
         ));
 
-        //Barre de progression de l'entainement
-        let titre_gauge = format!("Entraînement du modèle a partir du dataset.jsonl ... {}", app.progression);
+        // Barre de progression de l'entraînement
+        let titre_gauge = format!("Entraînement du modèle : {} %", app.progression);
         let gauge = Gauge::default()
             .block(Block::default().borders(Borders::ALL).title(titre_gauge))
-            .gauge_style(Style::default().fg(Color::LightGreen).bg(Color::Gray).add_modifier(Modifier::ITALIC))
+            .gauge_style(
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .bg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            )
             .percent(app.progression);
         frame.render_widget(gauge, chunks[1]);
-
     }
 
-    //Test simulation entrainement
-    pub fn training_simulation(tx_ia: Sender<IAMessage>, rx_cmd: Receiver<String>){
-        thread::spawn(move ||{
-            //Chemin absolu de la racine du projet
+    // Moteur d'entraînement et de génération IA
+    pub fn training_simulation(tx_ia: Sender<IAMessage>, rx_cmd: Receiver<String>) {
+        thread::spawn(move || {
             let project_root = env!("CARGO_MANIFEST_DIR");
-            //Construire un chemin propre vers le fichier de données
             let dataset_path = std::path::Path::new(project_root)
                 .join("dataset")
                 .join("php_mysql_QR.jsonl");
-            // 2. Vérification explicite de l'existence du fichier
+
             if !dataset_path.exists() {
-                let err_msg = format!("Fichier dataset introuvable à l'adresse : {:?}", dataset_path);
-                println!("{}", err_msg);
+                let err_msg = format!("Fichier dataset introuvable : {:?}", dataset_path);
                 let _ = tx_ia.send(IAMessage::ResponseChat(format!("MIC_IA : Erreur : {}", err_msg)));
                 return;
             }
-            //1. Charger le dataset fichier php_mysql.txt
-            // 3. Charger le dataset via JSONL
-            let dataset = match crate::dataset::TextDataset::load_dataset(&dataset_path) {
+
+            // 1. Charger le dataset
+            let dataset = match crate::dataset::TextDataset::load_dataset(&dataset_path, 2048) {
                 Ok(dataset) => dataset,
                 Err(e) => {
-                    let _ = tx_ia.send(IAMessage::ResponseChat(format!(
-                        "MIC_IA : Erreur lors de la lecture du fichier : {}", e
-                    )));
+                    let _ = tx_ia.send(IAMessage::ResponseChat(format!("MIC_IA : Erreur dataset : {}", e)));
                     return;
                 }
             };
-            //2. Init du periphérique de calcul Candle tensor Batch avec le GPU
-            let device = candle_core::Device::new_cuda(0).unwrap_or_else(|_e|{
-                eprintln!("CUDA est indisponible ({}), retourne sur ton CPU", _e);
-                candle_core::Device::Cpu
-            });
-            if device.is_cuda(){
+
+            // 2. Détection Device
+            let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+            if device.is_cuda() {
                 let _ = tx_ia.send(IAMessage::ResponseChat(
-                    "MIC_IA : Accélération matérielle activée sur la carte GPU NVIDIA !".to_string()
+                    "MIC_IA : Accélération matérielle CUDA activée !".to_string(),
                 ));
             }
-            let vocab_size = dataset.vocabulaire_length();
 
-            // 4. Sécurité supplémentaire : vérifier que le vocabulaire n'est pas vide
             if dataset.vocab_size == 0 {
-                let _ = tx_ia.send(IAMessage::ResponseChat(
-                    "MIC_IA : Le fichier dataset est vide ou le format JSONL n'a pas pu être lu !".to_string()
-                ));
+                let _ = tx_ia.send(IAMessage::ResponseChat("MIC_IA : Dataset vide !".to_string()));
                 return;
             }
 
-            let _ = tx_ia.send(IAMessage::ResponseChat(format!("MIC_IA : Données chargées ! Vocbulaire de {} de caractères unique.", vocab_size)));
+            let _ = tx_ia.send(IAMessage::ResponseChat(format!(
+                "MIC_IA : Données chargées ! Vocabulaire de {} tokens.", dataset.vocab_size
+            )));
 
-            let hidden_dim = 128;
-            //Initialisé le modele
-            let model = match crate::model::Model::new(dataset.vocab_size, hidden_dim, &device) {
-                Ok(model) => model,
+            // 3. Initialisation du modèle (UNE SEULE FOIS)
+            let varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+            let embed_dim = 128;
+            let hidden_dim = 384;
+
+            let model = match Model::new(vb, dataset.vocab_size, embed_dim, hidden_dim) {
+                Ok(m) => m,
                 Err(e) => {
-                    let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur de chargement du modele et d'initialisation du reseau de neurone : {}", e)));
+                    let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur création modèle: {}", e)));
                     return;
                 }
             };
 
             let _ = tx_ia.send(IAMessage::ResponseChat(
-                "MIC_IA : Réseau de neurones initialisé avec succès !".to_string()
+                "MIC_IA : Réseau de neurones initialisé avec succès !".to_string(),
             ));
 
-            // 3. Boucle d'entraînement (Ajustements recommandés)
-            let total_step = 10000;    // Donne-lui assez de temps pour converger
-            let batch_size = 128;       // Réduit légèrement si tu augmentes seq_len
-            let seq_len = 128;         // Plus long pour capter la structure ChatML + PHP
-            let learning_rate = 0.0003f32; // 0.0003 au lieu de 0.005 !! (Essentiel)
+            // 4. Initialisation d'AdamW
+            let params = ParamsAdamW {
+                lr: 0.0003,
+                ..Default::default()
+            };
 
-            for step in 1..=total_step{
-                //1. Generation des lots (batchs) = X entrée, Y_true (ce que IA doit deviner)
-                if let Ok((x, y_true)) = dataset.generate_batch_tensor(batch_size, seq_len, &device){
-                    //2. FORWARD PASS = Calcul des prédictions
-                    if let Ok(predictions) = model.forward(&x){
-                        //3. Calcul de la perte LOSS (les erreurs de prédictions)
-                        let pred_flat = match predictions.reshape((batch_size * seq_len, vocab_size)) {
-                            Ok(predictions) => predictions,
-                            Err(_) => continue,
-                        };
-                        //Applatire les cibles
-                        let targets_flat = match y_true.reshape(batch_size * seq_len) {
-                            Ok(targets) => targets,
-                            Err(_) => continue,
-                        };
-                        //L'entropie caractérise l'aptitude de l'énergie contenue dans un système à fournir du travail,
-                        // et donc également son incapacité à le faire : plus cette grandeur est élevée, plus l'énergie est dispersée, homogénéisée et donc moins utilisable
-                        // Utilisation de la CrossEntropy native de Candle (Loss d'évaluation)
-                        if let Ok(loss) = candle_nn::loss::cross_entropy(&pred_flat, &targets_flat){
-                            //4. BACKWARD PASS = calcul automatique des gradients
-                            //Gradient = champ de vecteurs qui combine en chaque point les différentes dérivées partielles
-                            // et donne ainsi à la fois la direction de la variation la plus forte[1] localement et l’intensité de cette variation.
-                            if let Ok(grads) = loss.backward() {
+            let mut opt = match candle_nn::AdamW::new(varmap.all_vars(), params) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur AdamW: {}", e)));
+                    return;
+                }
+            };
 
-                                // 5. DESCENTE DE GRADIENT (Mise à jour des poids manuelle pour comprendre le mécanisme)
-                                let vars = model.variables();
-                                for var in vars {
-                                    if let Some(grad_tensor) = grads.get(&var) {
-                                        // Formule : W = W - (learning_rate * grad)
-                                        if let Ok(update) = grad_tensor.clone() * (learning_rate as f64) {
-                                            if let Ok(new_val) = var.as_tensor().sub(&update) {
-                                                let _ = var.set(&new_val); // On applique les nouveaux poids !
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            //Affichage regulier de la perte (Loss) dans ratatui pour suivre la progression
-                            if step % 20 == 0 || step == 1{
-                                if let Ok(loss_val) = loss.to_vec0::<f32>(){
-                                    let _ = tx_ia.send(IAMessage::ResponseChat(format!(
-                                        "Etape : {:03}/{} | Perte (Loss) : {:.4}",
-                                        step, total_step, loss_val
-                                    )));
-                                }
+            // 5. Boucle d'entraînement
+            let total_step = 5000;
+            let batch_size = 32;
+            let seq_len = 128;
+            let mut last_percent = 0;
+
+            for step in 1..=total_step {
+                let (x, y_true) = match dataset.generate_batch_tensor(batch_size, seq_len, &device) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur batch: {}", e)));
+                        break;
+                    }
+                };
+
+                let predictions = match model.forward(&x) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur forward: {}", e)));
+                        break;
+                    }
+                };
+
+                let pred_flat = match predictions.reshape((batch_size * seq_len, dataset.vocab_size)) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur reshape pred: {}", e)));
+                        break;
+                    }
+                };
+
+                let targets_flat = match y_true.reshape(batch_size * seq_len) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur reshape target: {}", e)));
+                        break;
+                    }
+                };
+
+                match candle_nn::loss::cross_entropy(&pred_flat, &targets_flat) {
+                    Ok(loss) => {
+                        if let Err(e) = opt.backward_step(&loss) {
+                            let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur opt: {}", e)));
+                            break;
+                        }
+
+                        if step % 100 == 0 || step == 1 {
+                            if let Ok(loss_val) = loss.to_vec0::<f32>() {
+                                let _ = tx_ia.send(IAMessage::ResponseChat(format!(
+                                    "Step [{:05}/{}] | Loss: {:.4}", step, total_step, loss_val
+                                )));
                             }
                         }
                     }
+                    Err(e) => {
+                        let _ = tx_ia.send(IAMessage::ResponseChat(format!("Erreur loss: {}", e)));
+                        break;
+                    }
                 }
-                let pourcentage = (step * 100 / total_step) as u16;
-                let _ = tx_ia.send(IAMessage::ProgressionEntainement(pourcentage));
-                //thread::sleep(Duration::from_millis(1));
+
+                let pourcentage = ((step as f32 / total_step as f32) * 100.0) as u16;
+                if pourcentage != last_percent {
+                    last_percent = pourcentage;
+                    let _ = tx_ia.send(IAMessage::ProgressionEntainement(pourcentage));
+                }
             }
 
-            //Envoie du message dans le chat cpour confimer le chargent du fichier de données
             let _ = tx_ia.send(IAMessage::ResponseChat(
-                "MIC_IA : Entraînement terminé avec succès ! Écris une amorce de code PHP et j'essaierai de la compléter.".to_string()
+                "MIC_IA : Entraînement terminé ! Écris une question ou du code PHP à compléter.".to_string(),
             ));
-            //Attente de la question de l'utilisateur
+
+            // 6. Boucle de génération
             while let Ok(cmd) = rx_cmd.recv() {
-                let _ = tx_ia.send(IAMessage::ResponseChat("MIC_IA : En cours de génération ...".to_string()));
-                let temperature = 0.2f32; //Pertinence de la réponse en 0.1 et 1.0
-                //Generer 50 caractères a partir du prompt utilisateur
-                match model.generate_response(&cmd, 80,0.7f32, &dataset, &device) {
+                let _ = tx_ia.send(IAMessage::ResponseChat(
+                    "MIC_IA : Génération de la réponse en cours...".to_string(),
+                ));
+
+                match model.generate_response(&cmd, 80, 0.7f32, &dataset, &device, &tx_ia) {
                     Ok(generated_response) => {
                         let _ = tx_ia.send(IAMessage::ResponseChat(format!(
-                            "Votre réponse :\n{}", generated_response
+                            "MIC_IA : {}", generated_response
                         )));
-                        }
+                    }
                     Err(e) => {
                         let _ = tx_ia.send(IAMessage::ResponseChat(format!(
-                            "MIC_IA : Erreur lors de la génération de la réponse ! {}", e
+                            "MIC_IA : Erreur génération : {}\n", e
                         )));
                     }
                 }
@@ -271,49 +298,43 @@ impl App{
         });
     }
 
-    //----------------------------------INIT IA-------------------------//
-    pub fn run() -> io::Result<()>{
-        //1.  Init des chanels de communication
+    //----------------------------------INIT UI ET BOUCLE EVENT-------------------------//
+    pub fn run() -> io::Result<()> {
         let (tx_ia, rx_ia) = mpsc::channel::<IAMessage>();
         let (tx_ia_cmd, rx_ia_cmd) = mpsc::channel::<String>();
-        //2.  Lancement de la simulation d'entrainement
+
         Self::training_simulation(tx_ia, rx_ia_cmd);
-        //3. COnfig du terminal ratatui
+
         enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-        //4. Instance de l'application
         let mut app = App::new(rx_ia, tx_ia_cmd);
-        //Timer
-        let tick_rate = Duration::from_millis(250);
-        //Dernière frame
+        let tick_rate = Duration::from_millis(100);
         let mut last_tick = Instant::now();
 
-        //5. Boucle principale du rendu
         loop {
             terminal.draw(|mut f| App::ui(&mut f, &app))?;
-            //Gestion du timer pour ne pas saturer le CPU
+
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
             if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press{
+                    if key.kind == KeyEventKind::Press {
                         match key.code {
-                            KeyCode::Esc => break, //Touche Echap quitte application
-                            //Fleche de gauche et droite pour déplacer le curseur
+                            KeyCode::Esc => break,
                             KeyCode::Left => {
-                                if app.cursor_position > 0{
+                                if app.cursor_position > 0 {
                                     app.cursor_position -= 1;
                                 }
                             }
                             KeyCode::Right => {
-                                if app.cursor_position < app.input.chars().count(){
+                                if app.cursor_position < app.input.chars().count() {
                                     app.cursor_position += 1;
                                 }
                             }
-                            //Inserer un caractère précisement ou ce situe le curseur
                             KeyCode::Char(c) => {
-                                let byte_index = app.input
+                                let byte_index = app
+                                    .input
                                     .char_indices()
                                     .nth(app.cursor_position)
                                     .map(|(i, _)| i)
@@ -323,30 +344,29 @@ impl App{
                                 app.cursor_position += 1;
                             }
                             KeyCode::Backspace => {
-                                if app.cursor_position > 0{
+                                if app.cursor_position > 0 {
                                     app.cursor_position -= 1;
-                                }
-                                if let Some((byte_index, _)) = app.input.char_indices().nth(app.cursor_position) {
+                                    let byte_index = app
+                                        .input
+                                        .char_indices()
+                                        .nth(app.cursor_position)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or_else(|| app.input.len());
                                     app.input.remove(byte_index);
                                 }
                             }
-                            //Scroll Haut et BAs
                             KeyCode::Up => {
-                                app.scroll_offset = app.cursor_position.saturating_sub(1)
+                                app.scroll_offset = app.scroll_offset.saturating_sub(1);
                             }
                             KeyCode::Down => {
-                                app.scroll_offset = app.cursor_position.saturating_sub(1)
+                                app.scroll_offset = app.scroll_offset.saturating_add(1);
                             }
                             KeyCode::Enter => {
-                                if !app.input.is_empty(){
-                                    let message = app.input.drain(..).collect::<String>(); //Stock de la question utilisateur
+                                if !app.input.is_empty() {
+                                    let message = app.input.drain(..).collect::<String>();
                                     app.historique_chat.push(format!("Vous : {}", message));
-                                    //Auto scroll
                                     app.scroll_offset = app.historique_chat.len();
-                                    //Envoie la commande au fil thread IA
                                     let _ = app.tx_ia_cmd.send(message);
-                                    //Effacer le prompt + position du curseur
-                                    app.input.clear();
                                     app.cursor_position = 0;
                                 }
                             }
@@ -355,26 +375,34 @@ impl App{
                     }
                 }
             }
-            //6. Verification des messages envoyé par IA en arrière plan
+
+            // Réception des messages de l'IA en temps réel
             while let Ok(msg) = app.rx_ia.try_recv() {
                 match msg {
                     IAMessage::ProgressionEntainement(p) => {
                         app.progression = p;
-                        if p == 100 && app.progression != p{
-                            app.historique_chat.push("MIC_IA : Mon entraînement est terminé, je suis pret a te réponde ...".to_string());
-                        }
                     }
                     IAMessage::ResponseChat(texte) => {
-                        app.historique_chat.push(format!("MIC_IA : {}",texte));
+                        app.historique_chat.push(texte);
+                        app.scroll_offset = app.historique_chat.len();
+                    }
+                    IAMessage::StreamChunk(chunk) => {
+                        //Ajouter un token texte au dernier message
+                        if let Some(last_msg) = app.historique_chat.last_mut() {
+                            last_msg.push_str(&chunk);
+                        }else{
+                            app.historique_chat.push(format!("MIC_IA : {}", chunk));
+                        }
                         app.scroll_offset = app.historique_chat.len();
                     }
                 }
             }
+
             if last_tick.elapsed() >= tick_rate {
                 last_tick = Instant::now();
             }
         }
-        //Restauration du terminal apres fermeture
+
         disable_raw_mode()?;
         stdout().execute(LeaveAlternateScreen)?;
         Ok(())

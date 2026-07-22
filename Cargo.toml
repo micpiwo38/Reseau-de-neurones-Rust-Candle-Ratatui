@@ -11,12 +11,12 @@ anyhow = "1.0" # Analyseur d'erreur ergonomique avec context
 rand = "0.8"
 
 #UI
-ratatui = "0.28"
-crossterm = {version = "0.28", features = ["event-stream"]}
+ratatui = "0.30.2"
+crossterm = {version = "0.29.0", features = ["event-stream"]}
 
 #Async et thread
 tokio = {version = "1.0", features = ["full"]}
 #Parser Json
 serde = {version = "1.0", features = ["derive"]}
 serde_json = "1.0"
-tokenizers = "0.21" # Convertir le texte en token
+tokenizers = "0.23.1" # Convertir le texte en token
